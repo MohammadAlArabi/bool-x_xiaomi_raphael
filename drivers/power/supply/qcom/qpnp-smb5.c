@@ -234,6 +234,9 @@ struct smb_dt_props {
 	int			term_current_thresh_hi_ma;
 	int			term_current_thresh_lo_ma;
 	int			disable_suspend_on_collapse;
+	int			wdog_snarl_disable;
+	const char		*batt_psy_name;
+
 };
 
 struct smb5 {
@@ -242,7 +245,7 @@ struct smb5 {
 	struct smb_dt_props	dt;
 };
 
-static int __debug_mask = PR_MISC | PR_PARALLEL | PR_OTG | PR_OEM | PR_WLS;
+static int __debug_mask = 0;
 module_param_named(
 	debug_mask, __debug_mask, int, 0600
 );
@@ -982,6 +985,10 @@ static int smb5_parse_dt(struct smb5 *chip)
 		return rc;
 
 	rc = smblib_get_iio_channel(chg, "project_gpio6", &chg->iio.project_gpio6);
+
+	chip->dt.wdog_snarl_disable = of_property_read_bool(node,
+					"google,wdog_snarl_disable");
+
 	if (rc < 0)
 		return rc;
 
@@ -1661,6 +1668,10 @@ static int smb5_usb_main_get_prop(struct power_supply *psy,
 		break;
 	/* Use this property to report SMB health */
 	case POWER_SUPPLY_PROP_HEALTH:
+		if (chg->use_bq_pump) {
+			rc = val->intval = -ENODATA;
+			break;
+		}
 		rc = val->intval = smblib_get_prop_smb_health(chg);
 		break;
 	/* Use this property to report overheat status */
@@ -2205,6 +2216,7 @@ static enum power_supply_property smb5_batt_props[] = {
 	POWER_SUPPLY_PROP_TIME_TO_FULL_NOW,
 	POWER_SUPPLY_PROP_FCC_STEPPER_ENABLE,
 	POWER_SUPPLY_PROP_DC_THERMAL_LEVELS,
+	POWER_SUPPLY_PROP_SYSTEM_TEMP_LEVEL,
 };
 
 #define DEBUG_ACCESSORY_TEMP_DECIDEGC	250
@@ -2233,9 +2245,6 @@ static int smb5_batt_get_prop(struct power_supply *psy,
 		break;
 	case POWER_SUPPLY_PROP_CAPACITY:
 		rc = smblib_get_prop_batt_capacity(chg, val);
-		break;
-	case POWER_SUPPLY_PROP_SYSTEM_TEMP_LEVEL:
-		rc = smblib_get_prop_system_temp_level(chg, val);
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT:
 		rc = smblib_get_prop_system_temp_level(chg, val);
@@ -2375,6 +2384,15 @@ static int smb5_batt_get_prop(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_DYNAMIC_FV_ENABLED:
 		val->intval = chg->dynamic_fv_enabled;
 		break;
+	case POWER_SUPPLY_PROP_BATTERY_CHARGING_ENABLED:
+		rc = smblib_get_prop_battery_charging_enabled(chg, val);
+		break;
+	case POWER_SUPPLY_PROP_BATTERY_CHARGING_LIMITED:
+		rc = smblib_get_prop_battery_charging_limited(chg, val);
+		break;
+	case POWER_SUPPLY_PROP_SLOWLY_CHARGING:
+		rc = smblib_get_prop_battery_slowly_charging(chg, val);
+		break;
 	default:
 		pr_err("batt power supply prop %d not supported\n", psp);
 		return -EINVAL;
@@ -2411,9 +2429,6 @@ static int smb5_batt_set_prop(struct power_supply *psy,
 		break;
 	case POWER_SUPPLY_PROP_CAPACITY:
 		rc = smblib_set_prop_batt_capacity(chg, val);
-		break;
-	case POWER_SUPPLY_PROP_SYSTEM_TEMP_LEVEL:
-		rc = smblib_set_prop_system_temp_level(chg, val);
 		break;
 	case POWER_SUPPLY_PROP_PARALLEL_DISABLE:
 		vote(chg->pl_disable_votable, USER_VOTER, (bool)val->intval, 0);
@@ -2489,6 +2504,42 @@ static int smb5_batt_set_prop(struct power_supply *psy,
 		break;
 	case POWER_SUPPLY_PROP_FCC_STEPPER_ENABLE:
 		chg->fcc_stepper_enable = val->intval;
+		break;
+	case POWER_SUPPLY_PROP_BATTERY_CHARGING_ENABLED:
+		if (chg->use_bq_pump) {
+			if (val->intval == 0)
+				vote(chg->usb_icl_votable, MAIN_CHG_VOTER,
+							true, MAIN_CHARGER_STOP_ICL);
+			else
+				vote(chg->usb_icl_votable, MAIN_CHG_VOTER,
+							false, 0);
+			rerun_election(chg->usb_icl_votable);
+		}
+		break;
+	case POWER_SUPPLY_PROP_BATTERY_CHARGING_LIMITED:
+		if (chg->use_bq_pump) {
+			if (val->intval == 0) {
+				vote(chg->usb_icl_votable, MAIN_CHG_VOTER,
+							false, MAIN_CHARGER_ICL);
+			} else {
+				if (chg->real_charger_type == POWER_SUPPLY_TYPE_USB_HVDCP_3)
+					vote(chg->usb_icl_votable, MAIN_CHG_VOTER,
+								true, QC3_CHARGER_ICL);
+				else if (chg->real_charger_type == POWER_SUPPLY_TYPE_USB_HVDCP_3P5)
+					vote(chg->usb_icl_votable, MAIN_CHG_VOTER,
+								true, QC3P5_CHARGER_ICL);
+				else
+					vote(chg->usb_icl_votable, MAIN_CHG_VOTER,
+								true, MAIN_CHARGER_ICL);
+			}
+			rerun_election(chg->usb_icl_votable);
+		}
+		break;
+	case POWER_SUPPLY_PROP_SLOWLY_CHARGING:
+			rc = smblib_set_prop_battery_slowly_charging(chg, val);
+		break;
+	case POWER_SUPPLY_PROP_SYSTEM_TEMP_LEVEL:
+		rc = smblib_set_prop_system_temp_level(chg, val);
 		break;
 	default:
 		rc = -EINVAL;
@@ -4067,6 +4118,11 @@ static int smb5_request_interrupts(struct smb5 *chip)
 	if (chg->irq_info[BAT_TEMP_IRQ].irq && (chg->early_usb_attach || chg->early_dc_attach)) {
 		enable_irq_wake(chg->irq_info[BAT_TEMP_IRQ].irq);
 		chg->batt_temp_irq_enabled = true;
+	}
+
+	if (chg->irq_info[WDOG_SNARL_IRQ].irq && chip->dt.wdog_snarl_disable) {
+		disable_irq_wake(chg->irq_info[WDOG_SNARL_IRQ].irq);
+		disable_irq_nosync(chg->irq_info[WDOG_SNARL_IRQ].irq);
 	}
 
 	vote(chg->limited_irq_disable_votable, CHARGER_TYPE_VOTER, true, 0);
